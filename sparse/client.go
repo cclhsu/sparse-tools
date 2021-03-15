@@ -37,7 +37,10 @@ func SyncFile(localPath string, remote string, timeout int, directIO bool) error
 		return err
 	}
 	fileSize := fileInfo.Size()
-	log.Infof("source file size: %d, setting up directIo: %v", fileSize, directIO)
+	if directIO && fileSize%Blocks != 0 {
+		return fmt.Errorf("Invalid directIO file block size: %v", fileSize)
+	}
+	log.Infof("source file size: %d, setting up directIO: %v", fileSize, directIO)
 
 	var fileIo FileIoProcessor
 	if directIO {
@@ -53,9 +56,9 @@ func SyncFile(localPath string, remote string, timeout int, directIO bool) error
 
 	client := &syncClient{remote, timeout, localPath, fileSize, fileIo}
 
-	defer client.closeServer() // kill the server no matter success or not, best effort
+	defer client.closeServer(directIO) // kill the server no matter success or not, best effort
 
-	err = client.syncFileContent(fileIo, fileSize)
+	err = client.syncFileContent(fileIo, fileSize, directIO)
 	if err != nil {
 		log.Errorf("syncFileContent failed: %s", err)
 		return err
@@ -64,13 +67,13 @@ func SyncFile(localPath string, remote string, timeout int, directIO bool) error
 	return err
 }
 
-func (client *syncClient) syncFileContent(file FileIoProcessor, fileSize int64) error {
+func (client *syncClient) syncFileContent(file FileIoProcessor, fileSize int64, directIO bool) error {
 	exts, err := GetFiemapExtents(file)
 	if err != nil {
 		return err
 	}
 
-	err = client.openServer()
+	err = client.openServer(directIO)
 	if err != nil {
 		return fmt.Errorf("openServer failed, err: %s", err)
 	}
@@ -84,7 +87,7 @@ func (client *syncClient) syncFileContent(file FileIoProcessor, fileSize int64) 
 		// report hole
 		if lastIntervalEnd < interval.Begin {
 			holeInterval = Interval{lastIntervalEnd, interval.Begin}
-			err := client.syncHoleInterval(holeInterval)
+			err := client.syncHoleInterval(holeInterval, directIO)
 			if err != nil {
 				return fmt.Errorf("syncHoleInterval %s failed, err: %s", holeInterval, err)
 			}
@@ -92,7 +95,7 @@ func (client *syncClient) syncFileContent(file FileIoProcessor, fileSize int64) 
 		lastIntervalEnd = interval.End
 
 		// report data
-		err := client.syncDataInterval(file, interval)
+		err := client.syncDataInterval(file, interval, directIO)
 		if err != nil {
 			return fmt.Errorf("syncDataInterval %s failed, err: %s", interval, err)
 		}
@@ -104,7 +107,7 @@ func (client *syncClient) syncFileContent(file FileIoProcessor, fileSize int64) 
 				holeInterval := Interval{lastIntervalEnd, fileSize}
 
 				// syncing hole interval
-				err = client.syncHoleInterval(holeInterval)
+				err = client.syncHoleInterval(holeInterval, directIO)
 				if err != nil {
 					return fmt.Errorf("syncHoleInterval %s failed, err: %s", holeInterval, err)
 				}
@@ -118,7 +121,7 @@ func (client *syncClient) syncFileContent(file FileIoProcessor, fileSize int64) 
 		log.Infof("The file is a hole: %s", holeInterval)
 
 		// syncing hole interval
-		err := client.syncHoleInterval(holeInterval)
+		err := client.syncHoleInterval(holeInterval, directIO)
 		if err != nil {
 			return fmt.Errorf("syncHoleInterval %s failed, err: %s", holeInterval, err)
 		}
@@ -127,7 +130,7 @@ func (client *syncClient) syncFileContent(file FileIoProcessor, fileSize int64) 
 	return nil
 }
 
-func (client *syncClient) sendHTTPRequest(method string, action string, interval Interval, data []byte) (*http.Response, error) {
+func (client *syncClient) sendHTTPRequest(method string, action string, interval Interval, data []byte, directIO bool) (*http.Response, error) {
 	httpClient := &http.Client{Timeout: time.Duration(httpClientTimeout * time.Second)}
 
 	url := fmt.Sprintf("http://%s/v1-ssync/%s", client.remote, action)
@@ -144,6 +147,7 @@ func (client *syncClient) sendHTTPRequest(method string, action string, interval
 	}
 
 	req.Header.Add("Accept", "application/json")
+	req.Header.Add("DirectIO", strconv.FormatBool(directIO))
 
 	q := req.URL.Query()
 	q.Add("begin", strconv.FormatInt(interval.Begin, 10))
@@ -155,14 +159,14 @@ func (client *syncClient) sendHTTPRequest(method string, action string, interval
 	return httpClient.Do(req)
 }
 
-func (client *syncClient) openServer() error {
+func (client *syncClient) openServer(directIO bool) error {
 	var err error
 	var resp *http.Response
 
 	timeStart := time.Now()
 	timeStop := timeStart.Add(time.Duration(client.timeout) * time.Second)
 	for timeNow := timeStart; timeNow.Before(timeStop); timeNow = time.Now() {
-		resp, err = client.sendHTTPRequest("GET", "open", Interval{0, client.fileSize}, nil)
+		resp, err = client.sendHTTPRequest("GET", "open", Interval{0, client.fileSize}, nil, directIO)
 		if err == nil {
 			break
 		}
@@ -184,12 +188,12 @@ func (client *syncClient) openServer() error {
 	return nil
 }
 
-func (client *syncClient) closeServer() {
-	client.sendHTTPRequest("POST", "close", Interval{0, 0}, nil)
+func (client *syncClient) closeServer(directIO bool) {
+	client.sendHTTPRequest("POST", "close", Interval{0, 0}, nil, directIO)
 }
 
-func (client *syncClient) syncHoleInterval(holeInterval Interval) error {
-	resp, err := client.sendHTTPRequest("POST", "sendHole", holeInterval, nil)
+func (client *syncClient) syncHoleInterval(holeInterval Interval, directIO bool) error {
+	resp, err := client.sendHTTPRequest("POST", "sendHole", holeInterval, nil, directIO)
 	if err != nil {
 		return fmt.Errorf("sendHole failed, err: %s", err)
 	}
@@ -201,8 +205,8 @@ func (client *syncClient) syncHoleInterval(holeInterval Interval) error {
 	return nil
 }
 
-func (client *syncClient) getServerChecksum(checksumInterval Interval) ([]byte, error) {
-	resp, err := client.sendHTTPRequest("GET", "getChecksum", checksumInterval, nil)
+func (client *syncClient) getServerChecksum(checksumInterval Interval, directIO bool) ([]byte, error) {
+	resp, err := client.sendHTTPRequest("GET", "getChecksum", checksumInterval, nil, directIO)
 	if err != nil {
 		return nil, fmt.Errorf("getChecksum failed, err: %s", err)
 	}
@@ -214,8 +218,8 @@ func (client *syncClient) getServerChecksum(checksumInterval Interval) ([]byte, 
 	return ioutil.ReadAll(resp.Body)
 }
 
-func (client *syncClient) writeData(dataInterval Interval, data []byte) error {
-	resp, err := client.sendHTTPRequest("POST", "writeData", dataInterval, data)
+func (client *syncClient) writeData(dataInterval Interval, data []byte, directIO bool) error {
+	resp, err := client.sendHTTPRequest("POST", "writeData", dataInterval, data, directIO)
 	if err != nil {
 		return fmt.Errorf("writeData failed, err: %s", err)
 	}
@@ -227,7 +231,7 @@ func (client *syncClient) writeData(dataInterval Interval, data []byte) error {
 	return nil
 }
 
-func (client *syncClient) syncDataInterval(file FileIoProcessor, dataInterval Interval) error {
+func (client *syncClient) syncDataInterval(file FileIoProcessor, dataInterval Interval, directIO bool) error {
 	batch := numBlocksInBatch * Blocks
 
 	// Process data in chunks
@@ -252,7 +256,7 @@ func (client *syncClient) syncDataInterval(file FileIoProcessor, dataInterval In
 		go func() {
 			defer wg.Done()
 			var body []byte
-			if body, serverCksumErr = client.getServerChecksum(batchInterval); serverCksumErr != nil {
+			if body, serverCksumErr = client.getServerChecksum(batchInterval, directIO); serverCksumErr != nil {
 				log.Errorf("getServerChecksum batchInterval:%s failed, err: %s", batchInterval, serverCksumErr)
 				return
 			}
@@ -287,7 +291,7 @@ func (client *syncClient) syncDataInterval(file FileIoProcessor, dataInterval In
 		if serverNeedData {
 			// send data buffer
 			log.Debugf("sending dataBuffer size: %d", len(dataBuffer))
-			if err := client.writeData(batchInterval, dataBuffer); err != nil {
+			if err := client.writeData(batchInterval, dataBuffer, directIO); err != nil {
 				log.Errorf("writeData for batchInterval: %s failed, err: %s", batchInterval, err)
 				return err
 			}

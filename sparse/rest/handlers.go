@@ -59,18 +59,22 @@ func (server *SyncServer) open(writer http.ResponseWriter, request *http.Request
 }
 
 func (server *SyncServer) doOpen(request *http.Request) error {
+	// get directIO
+	directIO, err := strconv.ParseBool(request.Header.Get("directIO"))
+
 	// get file size
 	interval, err := server.getQueryInterval(request)
 	if err != nil {
 		return fmt.Errorf("server.getQueryInterval failed, err: %s", err)
 	}
 
-	// if file size is multiple of 4k, then directIo
-	directIo := (interval.End%sparse.Blocks == 0)
-	log.Infof("open: receiving fileSize: %d, setting up directIo: %v", interval.End, directIo)
+	if directIO && interval.End%sparse.Blocks != 0 {
+		return fmt.Errorf("Invalid directIO file block size: %v", interval.End)
+	}
+	log.Infof("open: receiving fileSize: %d, setting up directIO: %v", interval.End, directIO)
 
 	var fileIo sparse.FileIoProcessor
-	if directIo {
+	if directIO {
 		fileIo, err = sparse.NewDirectFileIoProcessor(server.filePath, os.O_RDWR, 0666, true)
 	} else {
 		fileIo, err = sparse.NewBufferedFileIoProcessor(server.filePath, os.O_RDWR, 0666, true)
